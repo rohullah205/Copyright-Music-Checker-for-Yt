@@ -1,6 +1,7 @@
 import os
 import re
-from typing import Any, Optional
+import time
+from typing import Any
 
 import requests
 import streamlit as st
@@ -54,23 +55,36 @@ def is_valid_youtube_url(value: str) -> bool:
     return bool(pattern.match(value))
 
 
-def call_gemini(prompt: str, api_key: str, model: str) -> str:
-    """Generate a report with the Google Gen AI SDK."""
+def call_gemini(prompt: str, api_key: str, model: str, max_attempts: int = 3) -> str:
+    """Generate a report, retrying temporary service overload errors."""
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config={
-            "temperature": 0.2,
-            "max_output_tokens": 1400,
-        },
-    )
-    text = getattr(response, "text", None)
-    if not text:
-        raise RuntimeError(
-            "Gemini returned an empty response. Check the model name and API access."
-        )
-    return text.strip()
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config={
+                    "temperature": 0.2,
+                    "max_output_tokens": 1400,
+                },
+            )
+            text = getattr(response, "text", None)
+            if not text:
+                raise RuntimeError(
+                    "Gemini returned an empty response. Check the model name and API access."
+                )
+            return text.strip()
+
+        except genai_errors.APIError as exc:
+            code = getattr(exc, "code", None)
+            # Retry only temporary server overload/service availability errors.
+            if code in (500, 502, 503, 504) and attempt < max_attempts:
+                time.sleep(2 ** attempt)  # 2 seconds, then 4 seconds
+                continue
+            raise
+
+    raise RuntimeError("Gemini remained unavailable after several attempts. Please try again later.")
 
 
 def identify_with_audd(audio_bytes: bytes, filename: str, token: str) -> dict[str, Any]:
@@ -272,10 +286,27 @@ if st.button("Analyze Music", type="primary", use_container_width=True):
             st.error("Gemini could not generate the report.")
             st.markdown("**Error details**")
             st.code(f"HTTP/API code: {code}\n{message}")
-            st.markdown(
-                "Check that the key is valid, the model is available to your project, "
-                "and your Gemini API quota has not been exhausted."
-            )
+            if code == 503:
+                st.warning(
+                    "Gemini is temporarily overloaded. The app already retried the request. "
+                    "Please wait a few minutes and try again. Your API key does not need to be "
+                    "replaced just because of this 503 response."
+                )
+            elif code in (500, 502, 504):
+                st.warning(
+                    "Gemini reported a temporary service problem. The app retried automatically; "
+                    "please wait a little and try again."
+                )
+            elif code == 429:
+                st.warning(
+                    "Gemini may have reached a rate limit or quota. Check usage and limits for "
+                    "your Google AI project before retrying."
+                )
+            else:
+                st.markdown(
+                    "Check that the key is valid, the model is available to your project, "
+                    "and your Gemini API quota has not been exhausted."
+                )
             st.stop()
         except Exception as exc:
             # Avoid printing secrets or the full request. Show a useful error type and message.
